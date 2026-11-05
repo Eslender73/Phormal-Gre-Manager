@@ -1,0 +1,950 @@
+
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+RUNNER="/usr/local/bin/phormal-gre-run"
+BASE="/etc/phormal/gre"
+
+[[ $EUID -eq 0 ]] || {
+    echo "ERROR: Run as root."
+    exit 1
+}
+
+[[ -f "$RUNNER" && -d "$BASE" ]] || {
+    echo "ERROR: Runner or tunnel directory not found."
+    exit 1
+}
+
+# Read a value from meta.conf without sourcing it.
+get_value() {
+    local file="$1" key="$2"
+    sed -n "s/^${key}=//p" "$file" | tail -n1
+}
+
+# Validate and safely update one configuration parameter.
+set_value() {
+    local file="$1" key="$2" value="$3"
+
+    python3 - "$file" "$key" "$value" <<'PY'
+import sys
+import re
+import ipaddress
+import os
+import tempfile
+from pathlib import Path
+
+p = Path(sys.argv[1])
+key = sys.argv[2]
+value = sys.argv[3]
+
+allowed = {
+    "ROLE", "TUN_MODE", "LOCAL_V4", "REMOTE_V4",
+    "LOCAL_PRIV", "REMOTE_PRIV", "IFACE", "MTU", "TTL"
+}
+
+if key not in allowed:
+    raise SystemExit("ERROR: Unsupported parameter")
+
+if not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
+    raise SystemExit("ERROR: Invalid characters in value")
+
+if key in ("LOCAL_V4", "REMOTE_V4",
+           "LOCAL_PRIV", "REMOTE_PRIV"):
+    try:
+        ipaddress.IPv4Address(value)
+    except ValueError:
+        raise SystemExit("ERROR: Invalid IPv4 address")
+
+elif key == "TUN_MODE":
+    if value not in ("gre", "ipip"):
+        raise SystemExit("ERROR: Mode must be gre or ipip")
+
+elif key == "MTU":
+    if not value.isdigit() or not 576 <= int(value) <= 9000:
+        raise SystemExit("ERROR: MTU must be 576-9000")
+
+elif key == "TTL":
+    if not value.isdigit() or not 1 <= int(value) <= 255:
+        raise SystemExit("ERROR: TTL must be 1-255")
+
+elif key == "IFACE":
+    if len(value) > 15:
+        raise SystemExit("ERROR: Interface name max length is 15")
+
+lines = p.read_text().splitlines()
+new_lines = []
+found = False
+
+for line in lines:
+    if line.startswith(key + "="):
+        if not found:
+            new_lines.append(f"{key}={value}")
+            found = True
+    else:
+        new_lines.append(line)
+
+if not found:
+    new_lines.append(f"{key}={value}")
+
+fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=".meta.")
+try:
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(new_lines) + "\n")
+    os.chmod(tmp, p.stat().st_mode)
+    os.replace(tmp, p)
+except:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+    raise
+
+print(f"Saved: {key}={value}")
+PY
+}
+
+# Discover tunnels.
+mapfile -t TUNNELS < <(
+    find "$BASE" -mindepth 2 -maxdepth 2 \
+        -type f -name meta.conf -printf '%h\n' |
+    sed "s#^${BASE}/##" |
+    sort -V
+)
+
+if [[ ${#TUNNELS[@]} -eq 0 ]]; then
+    echo "No tunnels found."
+    exit 1
+fi
+
+show_config() {
+    local meta="$1"
+
+    echo
+    echo "--------------- CONFIGURATION ---------------"
+
+    for key in ROLE TUN_MODE LOCAL_V4 REMOTE_V4 \
+               LOCAL_PRIV REMOTE_PRIV IFACE MTU TTL; do
+
+        value="$(get_value "$meta" "$key")"
+
+        case "$key" in
+            IFACE) value="${value:-phgre${name}}" ;;
+            MTU)   value="${value:-1476}" ;;
+            TTL)   value="${value:-255}" ;;
+        esac
+
+        printf "%-15s : %s\n" "$key" "${value:-not set}"
+    done
+
+    echo "---------------------------------------------"
+}
+
+
+live_ping_monitor() {
+    local tmpdir
+    tmpdir="$(mktemp -d /tmp/phormal-ping.XXXXXX)"
+
+    local key name meta iface remote
+    local -a pids
+    local -A history
+
+    declare -A interfaces
+    declare -A remotes
+
+    # Load tunnel information.
+    for name in "${TUNNELS[@]}"; do
+        meta="$BASE/$name/meta.conf"
+
+        iface="$(get_value "$meta" IFACE)"
+        iface="${iface:-phgre${name}}"
+
+        remote="$(get_value "$meta" REMOTE_PRIV)"
+
+        interfaces["$name"]="$iface"
+        remotes["$name"]="$remote"
+        history["$name"]=""
+    done
+
+    cleanup_ping() {
+        rm -rf "$tmpdir"
+    }
+
+    trap cleanup_ping RETURN
+
+    while true; do
+
+        # Start one ping simultaneously for every tunnel.
+        pids=()
+
+        for name in "${TUNNELS[@]}"; do
+            iface="${interfaces[$name]}"
+            remote="${remotes[$name]}"
+            result_file="$tmpdir/$name"
+
+            (
+                if [[ -n "$remote" ]] &&
+                   ip link show dev "$iface" >/dev/null 2>&1 &&
+                   ping -n -I "$iface" -c 1 -W 1 "$remote" \
+                       >/dev/null 2>&1; then
+                    echo 1 > "$result_file"
+                else
+                    echo 0 > "$result_file"
+                fi
+            ) &
+
+            pids+=("$!")
+        done
+
+        # Wait for all tunnel probes.
+        for pid in "${pids[@]}"; do
+            wait "$pid" || true
+        done
+
+        # Update rolling history.
+        for name in "${TUNNELS[@]}"; do
+
+            result_file="$tmpdir/$name"
+            result=0
+
+            [[ -f "$result_file" ]] &&
+                result="$(cat "$result_file")"
+
+            old="${history[$name]}"
+            read -r -a samples <<< "$old"
+
+            samples+=("$result")
+
+            # Keep only the latest 10 results.
+            if (( ${#samples[@]} > 10 )); then
+                samples=("${samples[@]: -10}")
+            fi
+
+            history["$name"]="${samples[*]}"
+
+        done
+
+        # Dynamic screen.
+        clear_screen
+
+        echo "=============================================================="
+        echo "              PHORMAL GRE - LIVE PING MONITOR"
+        echo "=============================================================="
+        echo
+        printf "%-12s %-16s %-17s %s\n" \
+            "TUNNEL" "INTERFACE" "REMOTE PRIV" "PACKET LOSS"
+        echo "--------------------------------------------------------------"
+
+        for name in "${TUNNELS[@]}"; do
+
+            iface="${interfaces[$name]}"
+            remote="${remotes[$name]}"
+
+            read -r -a samples <<< "${history[$name]}"
+
+            total="${#samples[@]}"
+            received=0
+
+            for sample in "${samples[@]}"; do
+                (( sample == 1 )) && ((received+=1))
+            done
+
+            lost=$((total - received))
+            loss=$((lost * 100 / total))
+
+            if (( total < 10 )); then
+                display="$loss% (${received}/${total})"
+            else
+                display="$loss% (${received}/10)"
+            fi
+
+            printf "%-12s %-16s %-17s %s\n" \
+                "$name" "$iface" "$remote" "$display"
+
+        done
+
+        echo
+        echo "--------------------------------------------------------------"
+        echo "Refresh: ~1 second | Rolling window: Last 10 packets"
+        echo "Packet Loss = Average of last 10 ping results"
+        echo
+        echo "Press Q to return to tunnel menu."
+
+        # Check keyboard without blocking the monitor.
+        if read -rsn1 -t 0.2 key; then
+            if [[ "$key" == "q" || "$key" == "Q" ]]; then
+                break
+            fi
+        fi
+
+    done
+
+    printf '\033[H\033[2J'
+    trap - RETURN
+    cleanup_ping
+}
+
+
+bulk_mtu_manager() {
+    clear_screen
+    echo
+    echo "================================================"
+    echo "          BULK MTU MANAGER"
+    echo "================================================"
+    echo
+
+    read -r -p "Enter new MTU for ALL tunnels (576-9000): " mtu
+
+    if [[ ! "$mtu" =~ ^[0-9]+$ ]] ||
+       (( mtu < 576 || mtu > 9000 )); then
+        echo "ERROR: Invalid MTU. Range: 576-9000"
+        return
+    fi
+
+    echo
+    echo "New MTU: $mtu"
+    echo
+    echo "Tunnels to be modified:"
+
+    for name in "${TUNNELS[@]}"; do
+        meta="$BASE/$name/meta.conf"
+
+        iface="$(get_value "$meta" IFACE)"
+        iface="${iface:-phgre${name}}"
+
+        actual="$(
+            ip -o link show dev "$iface" 2>/dev/null |
+            grep -oE 'mtu [0-9]+' |
+            awk '{print $2}' || true
+        )"
+
+        printf "%-12s %-16s Current=%-6s New=%s\n" \
+            "$name" "$iface" "${actual:-N/A}" "$mtu"
+    done
+
+    echo
+    read -r -p "Apply MTU=$mtu to ALL tunnels? [y/N]: " confirm
+
+    [[ "$confirm" =~ ^[Yy]$ ]] || {
+        echo "Cancelled."
+        return
+    }
+
+    local timestamp
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+
+    local -a changed=()
+    local name meta iface backup
+
+    echo
+    echo "Applying MTU to all tunnels..."
+    echo
+
+    for name in "${TUNNELS[@]}"; do
+
+        meta="$BASE/$name/meta.conf"
+
+        iface="$(get_value "$meta" IFACE)"
+        iface="${iface:-phgre${name}}"
+
+        backup="${meta}.bak.${timestamp}"
+
+        # Check interface exists.
+        if ! ip link show dev "$iface" >/dev/null 2>&1; then
+            echo "ERROR: Interface $iface not found."
+            echo "Rolling back previous changes..."
+
+            for rollback in "${changed[@]}"; do
+                cp -a "$BASE/$rollback/meta.conf.bak.${timestamp}" \
+                    "$BASE/$rollback/meta.conf"
+
+                old_iface="$(get_value "$BASE/$rollback/meta.conf" IFACE)"
+                old_iface="${old_iface:-phgre${rollback}}"
+
+                old_mtu="$(get_value "$BASE/$rollback/meta.conf" MTU)"
+                old_mtu="${old_mtu:-1476}"
+
+                ip link set dev "$old_iface" mtu "$old_mtu" || true
+            done
+
+            echo "Rollback completed."
+            return 1
+        fi
+
+        # Create backup.
+        cp -a "$meta" "$backup"
+
+        # Save new MTU in configuration.
+        if ! set_value "$meta" MTU "$mtu"; then
+            echo "ERROR: Failed to save MTU for $name"
+            cp -a "$backup" "$meta"
+
+            for rollback in "${changed[@]}"; do
+                cp -a "$BASE/$rollback/meta.conf.bak.${timestamp}" \
+                    "$BASE/$rollback/meta.conf"
+
+                old_iface="$(get_value "$BASE/$rollback/meta.conf" IFACE)"
+                old_iface="${old_iface:-phgre${rollback}}"
+
+                old_mtu="$(get_value "$BASE/$rollback/meta.conf" MTU)"
+                old_mtu="${old_mtu:-1476}"
+
+                ip link set dev "$old_iface" mtu "$old_mtu" || true
+            done
+
+            return 1
+        fi
+
+        # Apply immediately to active interface.
+        if ! ip link set dev "$iface" mtu "$mtu"; then
+
+            echo "ERROR: Failed to apply MTU on $iface"
+
+            cp -a "$backup" "$meta"
+
+            old_mtu="$(get_value "$meta" MTU)"
+            old_mtu="${old_mtu:-1476}"
+
+            ip link set dev "$iface" mtu "$old_mtu" || true
+
+            for rollback in "${changed[@]}"; do
+                cp -a "$BASE/$rollback/meta.conf.bak.${timestamp}" \
+                    "$BASE/$rollback/meta.conf"
+
+                old_iface="$(get_value "$BASE/$rollback/meta.conf" IFACE)"
+                old_iface="${old_iface:-phgre${rollback}}"
+
+                old_mtu="$(get_value "$BASE/$rollback/meta.conf" MTU)"
+                old_mtu="${old_mtu:-1476}"
+
+                ip link set dev "$old_iface" mtu "$old_mtu" || true
+            done
+
+            echo "Rollback completed."
+            return 1
+        fi
+
+        changed+=("$name")
+
+        echo "SUCCESS: $name ($iface) MTU=$mtu"
+
+    done
+
+    echo
+    echo "================================================"
+    echo "       ALL TUNNELS UPDATED SUCCESSFULLY"
+    echo "================================================"
+    echo
+
+    for name in "${TUNNELS[@]}"; do
+
+        meta="$BASE/$name/meta.conf"
+
+        iface="$(get_value "$meta" IFACE)"
+        iface="${iface:-phgre${name}}"
+
+        actual="$(
+            ip -o link show dev "$iface" 2>/dev/null |
+            grep -oE 'mtu [0-9]+' |
+            awk '{print $2}' || true
+        )"
+
+        printf "%-12s MTU=%s ACTUAL=%s\n" \
+            "$name" "$mtu" "${actual:-N/A}"
+
+    done
+
+    echo
+    echo "Configuration saved permanently."
+    echo "Backups: meta.conf.bak.${timestamp}"
+    echo "No service restart was performed."
+    echo
+    pause_screen
+
+}
+
+
+system_optimize() {
+    clear_screen
+    local RUNNER="/usr/local/bin/phormal-gre-run"
+    local SYSCTL="/etc/sysctl.d/99-phormal-optimize.conf"
+    local MODULES="/etc/modules-load.d/phormal-bbr.conf"
+    local BACKUP="/var/backups/phormal-optimize/$(date +%Y%m%d-%H%M%S)"
+
+    echo
+    echo "================================================"
+    echo "          PHORMAL SYSTEM OPTIMIZE"
+    echo "================================================"
+
+    mkdir -p "$BACKUP"
+
+    # ---------------------------------------------
+    # 1. Runner configuration
+    # ---------------------------------------------
+
+    echo
+    echo "[1/4] Checking GRE Runner..."
+
+    if [[ ! -f "$RUNNER" ]]; then
+        echo "ERROR: Runner not found: $RUNNER"
+        return 1
+    fi
+
+    cp -a "$RUNNER" "$BACKUP/phormal-gre-run"
+
+    if python3 - "$RUNNER" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1])
+s = p.read_text()
+
+# Ensure MTU is applied before interface is brought up.
+up_pattern = re.compile(
+    r'(?m)^([ \t]*)ip link set "\$\{IFACE\}" up[ \t]*$'
+)
+
+match = up_pattern.search(s)
+
+if not match:
+    # Support alternative existing syntax.
+    up_pattern = re.compile(
+        r'(?m)^([ \t]*)ip link set dev "\$\{IFACE\}" up[ \t]*$'
+    )
+    match = up_pattern.search(s)
+
+if not match:
+    print("ERROR: Expected interface-up command not found.")
+    sys.exit(1)
+
+# Recognize an existing MTU command.
+mtu_pattern = re.compile(
+    r'(?m)^[ \t]*ip link set(?: dev)? "\$\{IFACE\}" mtu '
+)
+
+mtu_lines = list(mtu_pattern.finditer(s))
+
+if mtu_lines:
+    existing = mtu_lines[0]
+
+    # If MTU command already exists before interface-up,
+    # no modification is necessary.
+    if existing.start() < match.start():
+        print("Runner already supports configurable MTU.")
+        sys.exit(0)
+
+    # Move an existing MTU command before interface-up.
+    line_start = s.rfind("\n", 0, existing.start()) + 1
+    line_end = s.find("\n", existing.end())
+
+    if line_end == -1:
+        line_end = len(s)
+
+    old_line = s[line_start:line_end]
+    s = s[:line_start] + s[line_end + 1:] if line_end < len(s) else s[:line_start]
+
+    match = up_pattern.search(s)
+
+    if not match:
+        print("ERROR: Could not relocate MTU command.")
+        sys.exit(1)
+
+    insertion = (
+        f'{match.group(1)}ip link set dev "${{IFACE}}" '
+        'mtu "${MTU:-1476}"\n'
+    )
+    s = s[:match.start()] + insertion + s[match.start():]
+
+else:
+    insertion = (
+        f'{match.group(1)}ip link set dev "${{IFACE}}" '
+        'mtu "${MTU:-1476}"\n'
+    )
+    s = s[:match.start()] + insertion + s[match.start():]
+
+p.write_text(s)
+print("Runner MTU configuration checked successfully.")
+PY
+    then
+        echo "Runner: OK"
+    else
+        echo "ERROR: Runner optimization failed."
+        cp -a "$BACKUP/phormal-gre-run" "$RUNNER"
+        return 1
+    fi
+
+    # ---------------------------------------------
+    # 2. Kernel BBR support
+    # ---------------------------------------------
+
+    echo
+    echo "[2/4] Checking TCP BBR..."
+
+    if ! modprobe tcp_bbr 2>/dev/null; then
+        echo "WARNING: modprobe tcp_bbr failed."
+        echo "Checking whether BBR is already built into kernel..."
+    fi
+
+    if [[ -d /sys/module/tcp_bbr ]]; then
+
+        echo "BBR kernel module: Available"
+
+        mkdir -p /etc/modules-load.d
+
+        if [[ -f "$MODULES" ]]; then
+            cp -a "$MODULES" "$BACKUP/phormal-bbr.conf"
+        fi
+
+        echo "tcp_bbr" > "$MODULES"
+
+    else
+        echo "ERROR: TCP BBR is not available in this kernel."
+        echo "Cannot enable BBR."
+        return 1
+    fi
+
+    # ---------------------------------------------
+    # 3. Persistent sysctl configuration
+    # ---------------------------------------------
+
+    echo
+    echo "[3/4] Configuring TCP congestion control..."
+
+    mkdir -p /etc/sysctl.d
+
+    if [[ -f "$SYSCTL" ]]; then
+        cp -a "$SYSCTL" "$BACKUP/99-phormal-optimize.conf"
+    fi
+
+    cat > "$SYSCTL" <<'EOF'
+# PHORMAL TCP Optimization
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+
+    if ! sysctl -w net.core.default_qdisc=fq; then
+        echo "ERROR: Failed to activate FQ."
+        return 1
+    fi
+
+    if ! sysctl -w net.ipv4.tcp_congestion_control=bbr; then
+        echo "ERROR: Failed to activate BBR."
+        return 1
+    fi
+
+    echo "Persistent configuration saved."
+
+    # ---------------------------------------------
+    # 4. Verification
+    # ---------------------------------------------
+
+    echo
+    echo "[4/4] Verifying optimization..."
+
+    local active_cc active_qdisc available
+
+    active_cc="$(sysctl -n net.ipv4.tcp_congestion_control)"
+    active_qdisc="$(sysctl -n net.core.default_qdisc)"
+    available="$(sysctl -n net.ipv4.tcp_available_congestion_control)"
+
+    echo
+    echo "--------------- OPTIMIZATION REPORT ---------------"
+
+    if [[ " $available " == *" bbr "* ]]; then
+        echo "[OK] BBR supported by kernel"
+    else
+        echo "[ERROR] BBR unavailable"
+    fi
+
+    if [[ "$active_cc" == "bbr" ]]; then
+        echo "[OK] TCP Congestion Control: BBR"
+    else
+        echo "[ERROR] TCP Congestion Control: $active_cc"
+    fi
+
+    if [[ "$active_qdisc" == "fq" ]]; then
+        echo "[OK] Default Qdisc: FQ"
+    else
+        echo "[WARNING] Default Qdisc: $active_qdisc"
+    fi
+
+    echo
+    echo "Runner: $RUNNER"
+    echo "Sysctl: $SYSCTL"
+    echo "Backup: $BACKUP"
+
+    echo "---------------------------------------------------"
+
+    # ---------------------------------------------
+    # 5. Optional bulk MTU update
+    # ---------------------------------------------
+
+    echo
+    read -r -p "Do you want to set a common MTU for ALL tunnels now? [y/N]: " answer
+
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        bulk_mtu_manager
+    fi
+
+    echo
+    echo "System Optimize completed."
+    echo "No tunnel services were restarted."
+    echo
+    pause_screen
+
+}
+
+
+# ==========================================
+# PHORMAL SCREEN MANAGEMENT
+# ==========================================
+
+clear_screen() {
+    printf '\033[2J\033[H'
+}
+
+pause_screen() {
+    echo
+    read -r -p "Press Enter to continue..." _
+}
+
+show_header() {
+    clear_screen
+
+    echo "================================================"
+    echo "              PHORMAL GRE MANAGER"
+    echo "================================================"
+    echo
+}
+
+
+while true; do
+
+    show_header
+    echo
+    echo "=============================================="
+    echo "          PHORMAL GRE MANAGER"
+    echo "=============================================="
+
+    for i in "${!TUNNELS[@]}"; do
+        name="${TUNNELS[$i]}"
+        meta="$BASE/$name/meta.conf"
+
+        iface="$(get_value "$meta" IFACE)"
+        iface="${iface:-phgre${name}}"
+
+        mtu="$(get_value "$meta" MTU)"
+        mtu="${mtu:-1476}"
+
+        actual="$(
+            ip -o link show dev "$iface" 2>/dev/null |
+            grep -oE 'mtu [0-9]+' |
+            awk '{print $2}' || true
+        )"
+
+        status="DOWN"
+        systemctl is-active --quiet \
+            "phormal-gre@${name}.service" && status="ACTIVE"
+
+        printf "%2d) %-12s MTU=%-5s ACTUAL=%-5s STATUS=%s\n" \
+            "$((i+1))" "$name" "$mtu" \
+            "${actual:-N/A}" "$status"
+    done
+
+    echo
+	echo " P) Live Ping Monitor"
+	echo " O) System Optimize"
+	echo " M) Set MTU for ALL tunnels"
+	
+    echo " 0) Exit"
+    echo
+
+    read -r -p "Select tunnel: " choice
+if [[ "$choice" == "o" || "$choice" == "O" ]]; then
+    system_optimize
+    continue
+fi	
+if [[ "$choice" == "m" || "$choice" == "M" ]]; then
+    bulk_mtu_manager
+    continue
+fi
+	
+if [[ "$choice" == "p" || "$choice" == "P" ]]; then
+    live_ping_monitor
+    continue
+fi
+    [[ "$choice" == "0" ]] && exit 0
+
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] ||
+       (( choice < 1 || choice > ${#TUNNELS[@]} )); then
+        echo "Invalid selection."
+        continue
+    fi
+
+    name="${TUNNELS[$((choice-1))]}"
+    dir="$BASE/$name"
+    meta="$dir/meta.conf"
+    service="phormal-gre@${name}.service"
+
+    while true; do
+        clear_screen
+        echo
+        echo "=============================================="
+        echo "          TUNNEL: $name"
+        echo "=============================================="
+
+        show_config "$meta"
+
+        echo
+        echo " 1) Change MTU"
+        echo " 2) Change Source Public IP (LOCAL_V4)"
+        echo " 3) Change Destination Public IP (REMOTE_V4)"
+        echo " 4) Change Local Private IP (LOCAL_PRIV)"
+        echo " 5) Change Remote Private IP (REMOTE_PRIV)"
+        echo " 6) Change Interface Name (IFACE)"
+        echo " 7) Change Tunnel Mode (GRE / IPIP)"
+        echo " 8) Change TTL"
+        echo " 9) Change Role"
+        echo
+        echo "10) Restart tunnel"
+        echo "11) Show service logs"
+        echo "12) Return to tunnel list"
+        echo
+
+        read -r -p "Select operation: " action
+
+        [[ "$action" == "12" ]] && break
+
+        case "$action" in
+            1) key="MTU";;
+            2) key="LOCAL_V4";;
+            3) key="REMOTE_V4";;
+            4) key="LOCAL_PRIV";;
+            5) key="REMOTE_PRIV";;
+            6) key="IFACE";;
+            7) key="TUN_MODE";;
+            8) key="TTL";;
+            9) key="ROLE";;
+
+            10)
+                echo "Restarting $service ..."
+                systemctl restart "$service"
+                systemctl status "$service" --no-pager -l || true
+                continue
+                ;;
+
+            11)
+                journalctl -u "$service" -n 60 --no-pager
+                continue
+                ;;
+
+            *)
+                echo "Invalid operation."
+                continue
+                ;;
+        esac
+
+        current="$(get_value "$meta" "$key")"
+
+        case "$key" in
+            MTU) current="${current:-1476}";;
+            TTL) current="${current:-255}";;
+            IFACE) current="${current:-phgre${name}}";;
+        esac
+
+        echo
+        echo "Parameter: $key"
+        echo "Current value: ${current:-not set}"
+
+        read -r -p "Enter new value (q to cancel): " new_value
+
+        [[ "$new_value" == "q" || "$new_value" == "Q" ]] && continue
+
+        if [[ "$new_value" == "$current" ]]; then
+            echo "No changes."
+            continue
+        fi
+
+        # Save a backup before modifying configuration.
+        backup="${meta}.bak.$(date +%Y%m%d-%H%M%S)"
+
+        cp -a "$meta" "$backup"
+
+        old_iface="$(get_value "$meta" IFACE)"
+        old_iface="${old_iface:-phgre${name}}"
+
+        # Update configuration.
+        if ! set_value "$meta" "$key" "$new_value"; then
+            echo "ERROR: Configuration was not changed."
+            cp -a "$backup" "$meta"
+            continue
+        fi
+
+        echo
+        echo "Configuration updated."
+        echo "Backup: $backup"
+
+        # Stop service and remove old interface.
+        systemctl stop "$service" || true
+        ip link del "$old_iface" 2>/dev/null || true
+
+        # Start service with new configuration.
+        echo "Starting $service ..."
+
+        if ! systemctl start "$service"; then
+
+            echo
+            echo "ERROR: New configuration failed."
+            echo "Restoring previous configuration..."
+
+            cp -a "$backup" "$meta"
+
+            systemctl stop "$service" || true
+            new_iface="$(get_value "$meta" IFACE)"
+            new_iface="${new_iface:-phgre${name}}"
+            ip link del "$new_iface" 2>/dev/null || true
+
+            systemctl start "$service" || true
+
+            echo "Rollback attempted. Check service logs."
+
+            systemctl status "$service" --no-pager -l || true
+
+            continue
+        fi
+
+        sleep 1
+
+        # Verify service and interface.
+        new_iface="$(get_value "$meta" IFACE)"
+        new_iface="${new_iface:-phgre${name}}"
+
+        actual="$(
+            ip -o link show dev "$new_iface" 2>/dev/null |
+            grep -oE 'mtu [0-9]+' |
+            awk '{print $2}' || true
+        )"
+
+        expected="$(get_value "$meta" MTU)"
+        expected="${expected:-1476}"
+
+        echo
+
+        if systemctl is-active --quiet "$service" &&
+           [[ -n "$actual" ]]; then
+
+            echo "SUCCESS: Tunnel is active."
+            echo "Interface: $new_iface"
+            echo "MTU: $actual"
+
+            if [[ "$actual" != "$expected" ]]; then
+                echo "WARNING: Expected MTU=$expected"
+            fi
+
+        else
+            echo "WARNING: Tunnel verification failed."
+            systemctl status "$service" --no-pager -l || true
+        fi
+
+        echo
+        read -r -p "Press Enter to continue..." _
+    done
+done

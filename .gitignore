@@ -1,0 +1,19 @@
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.bak
+*.backup
+*~
+
+# Logs
+*.log
+
+# Local configuration
+.env
+.env.*
+config.local
+
+# OS files
+.DS_Store
+Thumbs.db
