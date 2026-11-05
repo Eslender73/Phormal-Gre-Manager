@@ -55,7 +55,7 @@ Expected service format:
 Run the following command as root:
 
 ```bash
-curl -fsSL https://github.com/Eslender73/Phormal-Gre-Manager/blob/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Eslender73/Phormal-Gre-Manager/main/install.sh | bash
 ```
 
 After installation, launch the manager:
@@ -131,7 +131,7 @@ Always keep an independent backup of your server configuration before making net
 Run:
 
 ```bash
-curl -fsSL https://github.com/Eslender73/Phormal-Gre-Manager/blob/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Eslender73/Phormal-Gre-Manager/main/uninstall.sh | bash
 ```
 
 Uninstallation removes the PGM executable only. It does not remove GRE tunnels, PHORMAL configuration files, or systemd services.
