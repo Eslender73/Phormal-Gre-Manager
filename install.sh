@@ -33,7 +33,9 @@ curl -fLsS "$URL" -o "$TMP_FILE" || {
     exit 1
 }
 
-if ! head -n 1 "$TMP_FILE" | grep -q '^#!'; then
+FIRST_LINE="$(head -n 1 "$TMP_FILE" | tr -d '\r')"
+
+if [[ "$FIRST_LINE" != "#!/usr/bin/env bash" ]]; then
     echo "ERROR: Invalid PGM file."
     exit 1
 fi
